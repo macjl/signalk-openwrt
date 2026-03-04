@@ -5,14 +5,18 @@
  * runs mmcli to retrieve cellular modem signal metrics, and
  * publishes them to SignalK paths.
  *
- * SignalK paths published:
- *   environment.outside.cellular.type          - Network type (lte, 5g, umts...)
- *   environment.outside.cellular.rssi          - RSSI in dBm
- *   environment.outside.cellular.rsrp          - RSRP in dBm (LTE/5G)
- *   environment.outside.cellular.rsrq          - RSRQ in dB  (LTE/5G)
- *   environment.outside.cellular.snr           - SNR/SINR in dB (LTE/5G)
- *   environment.outside.cellular.operator      - Operator name
- *   environment.outside.cellular.connected     - Connection status (bool)
+ * Supports multiple modems on the same router, each published
+ * under a distinct path segment:
+ *
+ *   environment.outside.cellular.<id>.type
+ *   environment.outside.cellular.<id>.rssi
+ *   environment.outside.cellular.<id>.rsrp
+ *   environment.outside.cellular.<id>.rsrq
+ *   environment.outside.cellular.<id>.snr
+ *   environment.outside.cellular.<id>.operator
+ *   environment.outside.cellular.<id>.connected
+ *
+ * Where <id> is the modem's configured id (defaults to its index).
  */
 
 'use strict';
@@ -58,11 +62,29 @@ module.exports = function (app) {
         description: 'Path to private key file (e.g. /home/node/.ssh/id_rsa). Used if password is empty.',
         default: ''
       },
-      modemIndex: {
-        type: 'number',
-        title: 'Modem index',
-        description: 'ModemManager modem index (usually 0)',
-        default: 0
+      modems: {
+        type: 'array',
+        title: 'Modems',
+        description: 'List of modems to poll. Each modem is identified by its ModemManager index.',
+        default: [{ index: 0, id: '0' }],
+        items: {
+          type: 'object',
+          required: ['index'],
+          properties: {
+            index: {
+              type: 'number',
+              title: 'Modem index',
+              description: 'ModemManager modem index (from mmcli -L)',
+              default: 0
+            },
+            id: {
+              type: 'string',
+              title: 'Path identifier',
+              description: 'Segment used in the SignalK path, e.g. "lte", "5g", "sim1". Defaults to the modem index.',
+              default: '0'
+            }
+          }
+        }
       },
       pollInterval: {
         type: 'number',
@@ -78,7 +100,8 @@ module.exports = function (app) {
   // -------------------------------------------------------------------------
 
   plugin.start = function (options) {
-    app.debug(`Starting OpenWrt plugin — router: ${options.host}, modem index: ${options.modemIndex || 0}`);
+    const modems = normalizeModems(options);
+    app.debug(`Starting OpenWrt plugin — router: ${options.host}, modems: ${modems.map(m => `#${m.index}→${m.id}`).join(', ')}`);
     poll(options);
     pollTimer = setInterval(() => poll(options), (options.pollInterval || 30) * 1000);
   };
@@ -90,6 +113,22 @@ module.exports = function (app) {
     }
     app.debug('OpenWrt plugin stopped');
   };
+
+  // -------------------------------------------------------------------------
+  // Normalize modems config — support legacy single modemIndex field
+  // -------------------------------------------------------------------------
+
+  function normalizeModems(options) {
+    // Legacy single-modem config compatibility
+    if (!options.modems || options.modems.length === 0) {
+      const idx = options.modemIndex || 0;
+      return [{ index: idx, id: String(idx) }];
+    }
+    return options.modems.map(m => ({
+      index: m.index ?? 0,
+      id: m.id || String(m.index ?? 0)
+    }));
+  }
 
   // -------------------------------------------------------------------------
   // SSH helper — runs a single command and returns stdout
@@ -106,7 +145,6 @@ module.exports = function (app) {
         port: options.port || 22,
         username: options.username || 'root',
         readyTimeout: 10000,
-        // Tolerate OpenWrt's often self-signed or missing host key
         hostVerifier: () => true
       };
 
@@ -149,15 +187,13 @@ module.exports = function (app) {
   // Signal data fetching via mmcli
   // -------------------------------------------------------------------------
 
-  async function fetchSignal(options) {
-    const modemIdx = options.modemIndex || 0;
-    const raw = await sshExec(options, `/usr/bin/mmcli -m ${modemIdx} --signal-get --output-json`);
+  async function fetchSignal(options, modemIndex) {
+    const raw = await sshExec(options, `/usr/bin/mmcli -m ${modemIndex} --signal-get --output-json`);
     const data = JSON.parse(raw);
     const signal = data?.modem?.signal;
 
-    if (!signal) throw new Error('No signal data in mmcli output');
+    if (!signal) throw new Error(`No signal data for modem ${modemIndex}`);
 
-    // Detect best available technology
     const tech =
       (signal['5g'] && signal['5g'].rsrp !== '--') ? '5g' :
       (signal.lte  && signal.lte.rsrp  !== '--') ? 'lte' :
@@ -169,89 +205,93 @@ module.exports = function (app) {
 
     return {
       type: tech,
-      rssi: parseFloat(src.rssi)  || null,
-      rsrp: parseFloat(src.rsrp)  || null,
-      rsrq: parseFloat(src.rsrq)  || null,
-      snr:  parseFloat(src['s/n'] || src.snr) || null
+      rssi: parseFloat(src.rssi)               || null,
+      rsrp: parseFloat(src.rsrp)               || null,
+      rsrq: parseFloat(src.rsrq)               || null,
+      snr:  parseFloat(src['s/n'] || src.snr)  || null
     };
   }
 
-  async function fetchOperator(options) {
+  async function fetchOperator(options, modemIndex) {
     try {
-      const modemIdx = options.modemIndex || 0;
-      const raw = await sshExec(options, `/usr/bin/mmcli -m ${modemIdx} --output-json`);
+      const raw = await sshExec(options, `/usr/bin/mmcli -m ${modemIndex} --output-json`);
       const data = JSON.parse(raw);
       return data?.modem?.['3gpp']?.['operator-name'] || null;
     } catch (e) {
-      return null; // Operator name is optional
+      return null;
     }
   }
 
   // -------------------------------------------------------------------------
-  // Main poll
+  // Main poll — iterates over all configured modems
   // -------------------------------------------------------------------------
 
   async function poll(options) {
-    try {
-      const [signal, operator] = await Promise.all([
-        fetchSignal(options),
-        fetchOperator(options)
-      ]);
+    const modems = normalizeModems(options);
 
-      app.debug(`Signal: ${JSON.stringify(signal)}, operator: ${operator}`);
-      publishSignalK(signal, operator);
+    await Promise.all(modems.map(async (modem) => {
+      try {
+        const [signal, operator] = await Promise.all([
+          fetchSignal(options, modem.index),
+          fetchOperator(options, modem.index)
+        ]);
 
-    } catch (err) {
-      app.error(`OpenWrt poll error: ${err.message}`);
-    }
+        app.debug(`Modem ${modem.id}: ${JSON.stringify(signal)}, operator: ${operator}`);
+        publishSignalK(modem.id, signal, operator);
+
+      } catch (err) {
+        app.error(`OpenWrt poll error (modem ${modem.id}): ${err.message}`);
+      }
+    }));
   }
 
   // -------------------------------------------------------------------------
   // SignalK publishing
   // -------------------------------------------------------------------------
 
-  function publishSignalK(signal, operator) {
+  function publishSignalK(modemId, signal, operator) {
+    const base = `environment.outside.cellular.${modemId}`;
     const values = [];
     const now = new Date().toISOString();
 
     if (signal.type && signal.type !== 'unknown') {
-      values.push({ path: 'environment.outside.cellular.type', value: signal.type });
+      values.push({ path: `${base}.type`, value: signal.type });
     }
     if (signal.rssi !== null) {
-      values.push({ path: 'environment.outside.cellular.rssi', value: signal.rssi });
+      values.push({ path: `${base}.rssi`, value: signal.rssi });
     }
     if (signal.rsrp !== null) {
-      values.push({ path: 'environment.outside.cellular.rsrp', value: signal.rsrp });
+      values.push({ path: `${base}.rsrp`, value: signal.rsrp });
     }
     if (signal.rsrq !== null) {
-      values.push({ path: 'environment.outside.cellular.rsrq', value: signal.rsrq });
+      values.push({ path: `${base}.rsrq`, value: signal.rsrq });
     }
     if (signal.snr !== null) {
-      values.push({ path: 'environment.outside.cellular.snr', value: signal.snr });
+      values.push({ path: `${base}.snr`, value: signal.snr });
     }
     if (operator) {
-      values.push({ path: 'environment.outside.cellular.operator', value: operator });
+      values.push({ path: `${base}.operator`, value: operator });
     }
 
     values.push({
-      path: 'environment.outside.cellular.connected',
+      path: `${base}.connected`,
       value: signal.rssi !== null || signal.rsrp !== null
     });
 
     if (values.length === 0) {
-      app.debug('No signal values to publish');
+      app.debug(`No signal values to publish for modem ${modemId}`);
       return;
     }
 
     app.handleMessage(plugin.id, {
       updates: [{
-        source: { label: plugin.id },
+        source: { label: `${plugin.id}.${modemId}` },
         timestamp: now,
         values
       }]
     });
 
-    app.debug(`Published ${values.length} SignalK values`);
+    app.debug(`Modem ${modemId}: published ${values.length} SignalK values`);
   }
 
   return plugin;

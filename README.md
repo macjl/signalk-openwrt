@@ -2,19 +2,26 @@
 
 SignalK plugin that connects to an OpenWrt 4G/5G router via **SSH** and publishes cellular modem signal metrics to SignalK paths, using ModemManager (`mmcli`).
 
+Supports multiple modems on the same router, each published under a distinct path segment.
+
 Tested on GL.iNet GL-X300B (OpenWrt 24.10).
 
 ## SignalK paths published
 
+For each configured modem (identified by its `id`):
+
 | Path | Description | Unit |
 |------|-------------|------|
-| `environment.outside.cellular.type` | Network technology | string (`lte`, `5g`, `umts`, `gsm`) |
-| `environment.outside.cellular.rssi` | Received Signal Strength Indicator | dBm |
-| `environment.outside.cellular.rsrp` | Reference Signal Received Power (LTE/5G) | dBm |
-| `environment.outside.cellular.rsrq` | Reference Signal Received Quality (LTE/5G) | dB |
-| `environment.outside.cellular.snr` | Signal-to-Noise Ratio / SINR (LTE/5G) | dB |
-| `environment.outside.cellular.operator` | Mobile operator name | string |
-| `environment.outside.cellular.connected` | Modem connection status | boolean |
+| `environment.outside.cellular.<id>.type` | Network technology | string (`lte`, `5g`, `umts`, `gsm`) |
+| `environment.outside.cellular.<id>.rssi` | Received Signal Strength Indicator | dBm |
+| `environment.outside.cellular.<id>.rsrp` | Reference Signal Received Power (LTE/5G) | dBm |
+| `environment.outside.cellular.<id>.rsrq` | Reference Signal Received Quality (LTE/5G) | dB |
+| `environment.outside.cellular.<id>.snr` | Signal-to-Noise Ratio / SINR (LTE/5G) | dB |
+| `environment.outside.cellular.<id>.operator` | Mobile operator name | string |
+| `environment.outside.cellular.<id>.connected` | Modem connection status | boolean |
+
+With a single modem configured as `id: "0"` (the default), paths become:
+`environment.outside.cellular.0.rssi`, etc.
 
 ## Requirements
 
@@ -28,9 +35,10 @@ Tested on GL.iNet GL-X300B (OpenWrt 24.10).
   /etc/init.d/modemmanager start
   ```
 - **SSH access** must be enabled (enabled by default on OpenWrt)
-- SSH signal polling must be enabled on the modem:
+- Signal polling must be enabled on each modem:
   ```sh
   mmcli -m 0 --signal-setup=30
+  mmcli -m 1 --signal-setup=30  # if a second modem is present
   ```
 
 ### On the SignalK server
@@ -48,8 +56,33 @@ In SignalK: **Server → Plugin Config → OpenWrt Cellular Signal**
 | Username | SSH username | `root` |
 | Password | SSH password (leave empty to use key auth) | — |
 | SSH private key path | Path to private key file (if no password) | — |
-| Modem index | ModemManager modem index | `0` |
+| Modems | List of modems to poll (see below) | one modem, index 0 |
 | Poll interval | Seconds between polls | `30` |
+
+### Modems configuration
+
+Each entry in the `modems` array has:
+
+| Field | Description | Default |
+|-------|-------------|---------|
+| `index` | ModemManager modem index (from `mmcli -L`) | `0` |
+| `id` | Path segment used in SignalK paths (e.g. `lte`, `5g`, `sim1`) | index value |
+
+Example with two modems:
+```json
+{
+  "host": "192.168.8.1",
+  "username": "root",
+  "password": "mypassword",
+  "modems": [
+    { "index": 0, "id": "lte" },
+    { "index": 1, "id": "5g" }
+  ],
+  "pollInterval": 30
+}
+```
+
+This publishes `environment.outside.cellular.lte.rssi`, `environment.outside.cellular.5g.rssi`, etc.
 
 ### SSH key authentication (recommended)
 
@@ -82,6 +115,10 @@ npm install --prefix ~/.signalk https://github.com/macjl/signalk-openwrt.git
 Restart SignalK after installation, then configure the plugin via **Server → Plugin Config**.
 
 ## Changelog
+
+### 0.3.0
+- Multi-modem support: configure multiple modems per router, each with its own SignalK path segment (`id`)
+- Backward compatible with single-modem configs
 
 ### 0.2.0
 - Switched from ubus JSON-RPC to SSH + mmcli for broader compatibility
