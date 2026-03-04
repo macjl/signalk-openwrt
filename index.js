@@ -2,21 +2,17 @@
  * signalk-openwrt
  *
  * SignalK plugin that connects to an OpenWrt router via SSH,
- * runs mmcli to retrieve cellular modem signal metrics, and
- * publishes them to SignalK paths.
+ * auto-discovers modems via ModemManager (mmcli -L), and
+ * publishes cellular signal metrics to SignalK paths.
  *
- * Supports multiple modems on the same router, each published
- * under a distinct path segment:
- *
- *   environment.outside.cellular.<id>.type
- *   environment.outside.cellular.<id>.rssi
- *   environment.outside.cellular.<id>.rsrp
- *   environment.outside.cellular.<id>.rsrq
- *   environment.outside.cellular.<id>.snr
- *   environment.outside.cellular.<id>.operator
- *   environment.outside.cellular.<id>.connected
- *
- * Where <id> is the modem's configured id (defaults to its index).
+ * Paths published per modem (indexed by ModemManager index):
+ *   environment.outside.cellular.<index>.type
+ *   environment.outside.cellular.<index>.rssi
+ *   environment.outside.cellular.<index>.rsrp
+ *   environment.outside.cellular.<index>.rsrq
+ *   environment.outside.cellular.<index>.snr
+ *   environment.outside.cellular.<index>.operator
+ *   environment.outside.cellular.<index>.connected
  */
 
 'use strict';
@@ -29,7 +25,7 @@ module.exports = function (app) {
 
   plugin.id = 'signalk-openwrt';
   plugin.name = 'OpenWrt Cellular Signal';
-  plugin.description = 'Publishes 4G/5G signal metrics from an OpenWrt router (via SSH + mmcli) to SignalK';
+  plugin.description = 'Auto-discovers modems on an OpenWrt router via SSH + mmcli and publishes cellular signal metrics to SignalK';
 
   plugin.schema = {
     type: 'object',
@@ -62,30 +58,6 @@ module.exports = function (app) {
         description: 'Path to private key file (e.g. /home/node/.ssh/id_rsa). Used if password is empty.',
         default: ''
       },
-      modems: {
-        type: 'array',
-        title: 'Modems',
-        description: 'List of modems to poll. Each modem is identified by its ModemManager index.',
-        default: [{ index: 0, id: '0' }],
-        items: {
-          type: 'object',
-          required: ['index'],
-          properties: {
-            index: {
-              type: 'number',
-              title: 'Modem index',
-              description: 'ModemManager modem index (from mmcli -L)',
-              default: 0
-            },
-            id: {
-              type: 'string',
-              title: 'Path identifier',
-              description: 'Segment used in the SignalK path, e.g. "lte", "5g", "sim1". Defaults to the modem index.',
-              default: '0'
-            }
-          }
-        }
-      },
       pollInterval: {
         type: 'number',
         title: 'Poll interval (seconds)',
@@ -100,8 +72,7 @@ module.exports = function (app) {
   // -------------------------------------------------------------------------
 
   plugin.start = function (options) {
-    const modems = normalizeModems(options);
-    app.debug(`Starting OpenWrt plugin — router: ${options.host}, modems: ${modems.map(m => `#${m.index}→${m.id}`).join(', ')}`);
+    app.debug(`Starting OpenWrt plugin — router: ${options.host}`);
     poll(options);
     pollTimer = setInterval(() => poll(options), (options.pollInterval || 30) * 1000);
   };
@@ -113,22 +84,6 @@ module.exports = function (app) {
     }
     app.debug('OpenWrt plugin stopped');
   };
-
-  // -------------------------------------------------------------------------
-  // Normalize modems config — support legacy single modemIndex field
-  // -------------------------------------------------------------------------
-
-  function normalizeModems(options) {
-    // Legacy single-modem config compatibility
-    if (!options.modems || options.modems.length === 0) {
-      const idx = options.modemIndex || 0;
-      return [{ index: idx, id: String(idx) }];
-    }
-    return options.modems.map(m => ({
-      index: m.index ?? 0,
-      id: m.id || String(m.index ?? 0)
-    }));
-  }
 
   // -------------------------------------------------------------------------
   // SSH helper — runs a single command and returns stdout
@@ -184,6 +139,26 @@ module.exports = function (app) {
   }
 
   // -------------------------------------------------------------------------
+  // Modem discovery via mmcli -L
+  // Parses output like:
+  //   /org/freedesktop/ModemManager1/Modem/0 [manufacturer] model
+  //   /org/freedesktop/ModemManager1/Modem/1 [manufacturer] model
+  // Returns array of integer indices: [0, 1, ...]
+  // -------------------------------------------------------------------------
+
+  async function discoverModems(options) {
+    const raw = await sshExec(options, '/usr/bin/mmcli -L');
+    const indices = [];
+    for (const line of raw.split('\n')) {
+      const match = line.match(/\/Modem\/(\d+)/);
+      if (match) {
+        indices.push(parseInt(match[1], 10));
+      }
+    }
+    return indices;
+  }
+
+  // -------------------------------------------------------------------------
   // Signal data fetching via mmcli
   // -------------------------------------------------------------------------
 
@@ -205,10 +180,10 @@ module.exports = function (app) {
 
     return {
       type: tech,
-      rssi: parseFloat(src.rssi)               || null,
-      rsrp: parseFloat(src.rsrp)               || null,
-      rsrq: parseFloat(src.rsrq)               || null,
-      snr:  parseFloat(src['s/n'] || src.snr)  || null
+      rssi: parseFloat(src.rssi)              || null,
+      rsrp: parseFloat(src.rsrp)              || null,
+      rsrq: parseFloat(src.rsrq)              || null,
+      snr:  parseFloat(src['s/n'] || src.snr) || null
     };
   }
 
@@ -223,24 +198,37 @@ module.exports = function (app) {
   }
 
   // -------------------------------------------------------------------------
-  // Main poll — iterates over all configured modems
+  // Main poll — auto-discovers modems then polls each one
   // -------------------------------------------------------------------------
 
   async function poll(options) {
-    const modems = normalizeModems(options);
+    let indices;
+    try {
+      indices = await discoverModems(options);
+    } catch (err) {
+      app.error(`OpenWrt modem discovery failed: ${err.message}`);
+      return;
+    }
 
-    await Promise.all(modems.map(async (modem) => {
+    if (indices.length === 0) {
+      app.debug('No modems found on router');
+      return;
+    }
+
+    app.debug(`Discovered modems: [${indices.join(', ')}]`);
+
+    await Promise.all(indices.map(async (idx) => {
       try {
         const [signal, operator] = await Promise.all([
-          fetchSignal(options, modem.index),
-          fetchOperator(options, modem.index)
+          fetchSignal(options, idx),
+          fetchOperator(options, idx)
         ]);
 
-        app.debug(`Modem ${modem.id}: ${JSON.stringify(signal)}, operator: ${operator}`);
-        publishSignalK(modem.id, signal, operator);
+        app.debug(`Modem ${idx}: ${JSON.stringify(signal)}, operator: ${operator}`);
+        publishSignalK(idx, signal, operator);
 
       } catch (err) {
-        app.error(`OpenWrt poll error (modem ${modem.id}): ${err.message}`);
+        app.error(`OpenWrt poll error (modem ${idx}): ${err.message}`);
       }
     }));
   }
@@ -249,8 +237,8 @@ module.exports = function (app) {
   // SignalK publishing
   // -------------------------------------------------------------------------
 
-  function publishSignalK(modemId, signal, operator) {
-    const base = `environment.outside.cellular.${modemId}`;
+  function publishSignalK(modemIndex, signal, operator) {
+    const base = `environment.outside.cellular.${modemIndex}`;
     const values = [];
     const now = new Date().toISOString();
 
@@ -279,19 +267,19 @@ module.exports = function (app) {
     });
 
     if (values.length === 0) {
-      app.debug(`No signal values to publish for modem ${modemId}`);
+      app.debug(`No signal values to publish for modem ${modemIndex}`);
       return;
     }
 
     app.handleMessage(plugin.id, {
       updates: [{
-        source: { label: `${plugin.id}.${modemId}` },
+        source: { label: `${plugin.id}.${modemIndex}` },
         timestamp: now,
         values
       }]
     });
 
-    app.debug(`Modem ${modemId}: published ${values.length} SignalK values`);
+    app.debug(`Modem ${modemIndex}: published ${values.length} SignalK values`);
   }
 
   return plugin;
