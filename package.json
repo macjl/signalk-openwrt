@@ -1,0 +1,34 @@
+{
+  "name": "signalk-openwrt",
+  "version": "0.2.0",
+  "description": "Connects to an OpenWrt 4G/5G router via SSH and publishes cellular signal metrics (RSSI, RSRP, RSRQ, SNR) to SignalK paths",
+  "main": "index.js",
+  "keywords": [
+    "signalk-node-server-plugin",
+    "openwrt",
+    "4g",
+    "5g",
+    "lte",
+    "cellular",
+    "signal",
+    "modemmanager",
+    "mmcli",
+    "marine"
+  ],
+  "author": "Jean-Laurent Girod",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/macjl/signalk-openwrt.git"
+  },
+  "bugs": {
+    "url": "https://github.com/macjl/signalk-openwrt/issues"
+  },
+  "homepage": "https://github.com/macjl/signalk-openwrt#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "ssh2": "^1.16.0"
+  }
+}
