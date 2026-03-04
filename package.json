@@ -19,7 +19,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/macjl/signalk-openwrt.git"
+    "url": "git+https://github.com/macjl/signalk-openwrt.git"
   },
   "bugs": {
     "url": "https://github.com/macjl/signalk-openwrt/issues"
