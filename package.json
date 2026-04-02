@@ -25,6 +25,9 @@
     "url": "https://github.com/macjl/signalk-openwrt/issues"
   },
   "homepage": "https://github.com/macjl/signalk-openwrt#readme",
+  "scripts": {
+    "test": "node --test"
+  },
   "engines": {
     "node": ">=18.0.0"
   },
