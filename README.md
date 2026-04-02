@@ -89,8 +89,11 @@ Restart SignalK after installation, then configure the plugin via **Server → P
 
 ## Changelog
 
+### 0.4.1
+- Added a built-in Node test suite covering modem discovery, publishing, and error handling
+
 ### 0.4.0
-- Dynamic modem auto-discovery via `mmcli -L` — no manual modem configuration required
+- Dynamic modem auto-discovery via `mmcli -L` — no manual configuration required
 - Modems indexed by their ModemManager index in SignalK paths
 
 ### 0.3.0

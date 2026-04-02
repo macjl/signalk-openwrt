@@ -1,6 +1,6 @@
 {
   "name": "signalk-openwrt",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Connects to an OpenWrt 4G/5G router via SSH and publishes cellular signal metrics (RSSI, RSRP, RSRQ, SNR) to SignalK paths",
   "main": "index.js",
   "keywords": [
