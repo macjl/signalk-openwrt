@@ -101,7 +101,7 @@ Restart SignalK after installation, then configure the plugin via **Server → P
 
 ## Changelog
 
-### Unreleased
+### 0.4.3
 - Preserve zero-valued signal metrics instead of treating them as missing
 - Detect network technology from any available numeric signal field
 - Skip overlapping polls when a previous poll is still running
