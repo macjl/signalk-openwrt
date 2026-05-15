@@ -4,11 +4,11 @@ const Module = require('node:module');
 
 let mockBehavior = {};
 
-function makeStream({ code = 0, stdout = '', stderr = '' }) {
+function makeStream({ code = 0, stdout = '', stderr = '', delayMs = 0 }) {
   const handlers = {};
   const stderrHandlers = {};
 
-  setImmediate(() => {
+  setTimeout(() => {
     if (stdout) {
       handlers.data?.(stdout);
     }
@@ -16,7 +16,7 @@ function makeStream({ code = 0, stdout = '', stderr = '' }) {
       stderrHandlers.data?.(stderr);
     }
     handlers.close?.(code);
-  });
+  }, delayMs);
 
   return {
     on(event, cb) {
@@ -50,6 +50,9 @@ class FakeClient {
 
   exec(command, cb) {
     const behavior = mockBehavior[command];
+    if (behavior) {
+      behavior.calls = (behavior.calls || 0) + 1;
+    }
 
     if (behavior?.execError) {
       cb(behavior.execError);
@@ -61,7 +64,8 @@ class FakeClient {
       makeStream({
         code: behavior?.code ?? 0,
         stdout: behavior?.stdout ?? '',
-        stderr: behavior?.stderr ?? ''
+        stderr: behavior?.stderr ?? '',
+        delayMs: behavior?.delayMs ?? 0
       })
     );
   }
@@ -167,6 +171,79 @@ test('publishes LTE signal metrics for a discovered modem', async () => {
     { path: 'environment.outside.cellular.0.rsrq', value: -10 },
     { path: 'environment.outside.cellular.0.snr', value: 18.2 },
     { path: 'environment.outside.cellular.0.operator', value: 'Orange' },
+    { path: 'environment.outside.cellular.0.connected', value: true }
+  ]);
+});
+
+test('preserves zero-valued signal metrics', async () => {
+  const app = makeApp();
+  const plugin = pluginFactory(app);
+
+  mockBehavior['/usr/bin/mmcli -L'] = {
+    stdout: '/org/freedesktop/ModemManager1/Modem/0 [Quectel] RM520N\n'
+  };
+  mockBehavior['/usr/bin/mmcli -m 0 --signal-get --output-json'] = {
+    stdout: JSON.stringify({
+      modem: {
+        signal: {
+          lte: {
+            rssi: '-51',
+            rsrp: '-82',
+            rsrq: '-10',
+            's/n': '0'
+          }
+        }
+      }
+    })
+  };
+  mockBehavior['/usr/bin/mmcli -m 0 --output-json'] = {
+    stdout: JSON.stringify({ modem: {} })
+  };
+
+  plugin.start({ host: 'router', username: 'root', password: 'secret', pollInterval: 30 });
+
+  await settlePoll();
+  plugin.stop();
+
+  const values = app.messages[0].delta.updates[0].values;
+  assert.ok(values.some((entry) =>
+    entry.path === 'environment.outside.cellular.0.snr' && entry.value === 0
+  ));
+});
+
+test('detects technology from any available numeric signal field', async () => {
+  const app = makeApp();
+  const plugin = pluginFactory(app);
+
+  mockBehavior['/usr/bin/mmcli -L'] = {
+    stdout: '/org/freedesktop/ModemManager1/Modem/0 [Quectel] RM520N\n'
+  };
+  mockBehavior['/usr/bin/mmcli -m 0 --signal-get --output-json'] = {
+    stdout: JSON.stringify({
+      modem: {
+        signal: {
+          lte: {
+            rssi: '--',
+            rsrp: '--',
+            rsrq: '--',
+            's/n': '0'
+          }
+        }
+      }
+    })
+  };
+  mockBehavior['/usr/bin/mmcli -m 0 --output-json'] = {
+    stdout: JSON.stringify({ modem: {} })
+  };
+
+  plugin.start({ host: 'router', username: 'root', password: 'secret', pollInterval: 30 });
+
+  await settlePoll();
+  plugin.stop();
+
+  assert.deepEqual(app.messages[0].delta.updates[0].values, [
+    { path: 'environment.outside.cellular.0.type', value: 'lte' },
+    { path: 'environment.outside.cellular.0.snr', value: 0 },
     { path: 'environment.outside.cellular.0.connected', value: true }
   ]);
 });
@@ -298,7 +375,7 @@ test('continues polling other modems when one modem fails', async () => {
   assert.match(app.errorCalls[0], /modem 0/i);
 });
 
-test('stop clears the polling timer', () => {
+test('stop clears the polling timer', async () => {
   const originalSetInterval = global.setInterval;
   const originalClearInterval = global.clearInterval;
   const tokens = [];
@@ -325,6 +402,48 @@ test('stop clears the polling timer', () => {
     assert.equal(tokens.length, 1);
     assert.equal(tokens[0].interval, 30000);
     assert.deepEqual(cleared, [tokens[0]]);
+    await settlePoll();
+  } finally {
+    global.setInterval = originalSetInterval;
+    global.clearInterval = originalClearInterval;
+  }
+});
+
+test('skips interval polls while a previous poll is still running', async () => {
+  const originalSetInterval = global.setInterval;
+  const originalClearInterval = global.clearInterval;
+  const tokens = [];
+
+  global.setInterval = (fn, interval) => {
+    const token = { fn, interval };
+    tokens.push(token);
+    return token;
+  };
+  global.clearInterval = () => {};
+
+  try {
+    const app = makeApp();
+    const plugin = pluginFactory(app);
+
+    mockBehavior['/usr/bin/mmcli -L'] = {
+      stdout: '/org/freedesktop/ModemManager1/Modem/0 [Quectel] RM520N\n',
+      delayMs: 50
+    };
+    mockBehavior['/usr/bin/mmcli -m 0 --signal-get --output-json'] = {
+      stdout: JSON.stringify({ modem: { signal: { lte: { rsrp: '-90' } } } })
+    };
+    mockBehavior['/usr/bin/mmcli -m 0 --output-json'] = {
+      stdout: JSON.stringify({ modem: {} })
+    };
+
+    plugin.start({ host: 'router', username: 'root', password: 'secret', pollInterval: 30 });
+    tokens[0].fn();
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    plugin.stop();
+
+    assert.equal(mockBehavior['/usr/bin/mmcli -L'].calls, 1);
+    assert.ok(app.debugCalls.some((message) => /previous poll still running/i.test(message)));
   } finally {
     global.setInterval = originalSetInterval;
     global.clearInterval = originalClearInterval;

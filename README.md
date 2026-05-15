@@ -6,6 +6,18 @@ Modems are discovered dynamically at each poll — no manual configuration requi
 
 Tested on GL.iNet GL-X300B (OpenWrt 24.10).
 
+## Polling behavior
+
+At each poll, the plugin discovers currently available modems, reads their signal
+metrics, and publishes one SignalK update per modem.
+
+If a poll is still running when the next interval fires, the new poll is skipped.
+This avoids overlapping SSH sessions on slow or temporarily unresponsive routers.
+
+Network technology is selected from the first available technology that exposes a
+numeric signal value, in this priority order: `5g`, `lte`, `umts`, `gsm`.
+Numeric zero values (for example `0` dB SNR) are preserved and published.
+
 ## SignalK paths published
 
 For each discovered modem (indexed by its ModemManager index):
@@ -88,6 +100,14 @@ npm install --prefix ~/.signalk https://github.com/macjl/signalk-openwrt.git
 Restart SignalK after installation, then configure the plugin via **Server → Plugin Config**.
 
 ## Changelog
+
+### Unreleased
+- Preserve zero-valued signal metrics instead of treating them as missing
+- Detect network technology from any available numeric signal field
+- Skip overlapping polls when a previous poll is still running
+
+### 0.4.2
+- Synced package metadata with the npm release
 
 ### 0.4.1
 - Added a built-in Node test suite covering modem discovery, publishing, and error handling

@@ -22,6 +22,7 @@ const { Client } = require('ssh2');
 module.exports = function (app) {
   let plugin = {};
   let pollTimer = null;
+  let pollInProgress = false;
 
   plugin.id = 'signalk-openwrt';
   plugin.name = 'OpenWrt Cellular Signal';
@@ -169,22 +170,42 @@ module.exports = function (app) {
 
     if (!signal) throw new Error(`No signal data for modem ${modemIndex}`);
 
-    const tech =
-      (signal['5g'] && signal['5g'].rsrp !== '--') ? '5g' :
-      (signal.lte  && signal.lte.rsrp  !== '--') ? 'lte' :
-      (signal.umts && signal.umts.rssi !== '--') ? 'umts' :
-      (signal.gsm  && signal.gsm.rssi  !== '--') ? 'gsm' :
-      'unknown';
+    const tech = detectTechnology(signal);
 
     const src = signal[tech] || {};
 
     return {
       type: tech,
-      rssi: parseFloat(src.rssi)              || null,
-      rsrp: parseFloat(src.rsrp)              || null,
-      rsrq: parseFloat(src.rsrq)              || null,
-      snr:  parseFloat(src['s/n'] || src.snr) || null
+      rssi: parseSignalNumber(src.rssi),
+      rsrp: parseSignalNumber(src.rsrp),
+      rsrq: parseSignalNumber(src.rsrq),
+      snr: parseSignalNumber(src['s/n'] ?? src.snr)
     };
+  }
+
+  function detectTechnology(signal) {
+    for (const tech of ['5g', 'lte', 'umts', 'gsm']) {
+      if (hasSignalValue(signal[tech])) {
+        return tech;
+      }
+    }
+    return 'unknown';
+  }
+
+  function hasSignalValue(src) {
+    if (!src) return false;
+    return ['rssi', 'rsrp', 'rsrq', 's/n', 'snr'].some((key) =>
+      parseSignalNumber(src[key]) !== null
+    );
+  }
+
+  function parseSignalNumber(value) {
+    if (value === null || value === undefined || value === '--') {
+      return null;
+    }
+
+    const parsed = parseFloat(value);
+    return Number.isFinite(parsed) ? parsed : null;
   }
 
   async function fetchOperator(options, modemIndex) {
@@ -202,35 +223,46 @@ module.exports = function (app) {
   // -------------------------------------------------------------------------
 
   async function poll(options) {
-    let indices;
+    if (pollInProgress) {
+      app.debug('OpenWrt poll skipped: previous poll still running');
+      return;
+    }
+
+    pollInProgress = true;
+
     try {
-      indices = await discoverModems(options);
-    } catch (err) {
-      app.error(`OpenWrt modem discovery failed: ${err.message}`);
-      return;
-    }
-
-    if (indices.length === 0) {
-      app.debug('No modems found on router');
-      return;
-    }
-
-    app.debug(`Discovered modems: [${indices.join(', ')}]`);
-
-    await Promise.all(indices.map(async (idx) => {
+      let indices;
       try {
-        const [signal, operator] = await Promise.all([
-          fetchSignal(options, idx),
-          fetchOperator(options, idx)
-        ]);
-
-        app.debug(`Modem ${idx}: ${JSON.stringify(signal)}, operator: ${operator}`);
-        publishSignalK(idx, signal, operator);
-
+        indices = await discoverModems(options);
       } catch (err) {
-        app.error(`OpenWrt poll error (modem ${idx}): ${err.message}`);
+        app.error(`OpenWrt modem discovery failed: ${err.message}`);
+        return;
       }
-    }));
+
+      if (indices.length === 0) {
+        app.debug('No modems found on router');
+        return;
+      }
+
+      app.debug(`Discovered modems: [${indices.join(', ')}]`);
+
+      await Promise.all(indices.map(async (idx) => {
+        try {
+          const [signal, operator] = await Promise.all([
+            fetchSignal(options, idx),
+            fetchOperator(options, idx)
+          ]);
+
+          app.debug(`Modem ${idx}: ${JSON.stringify(signal)}, operator: ${operator}`);
+          publishSignalK(idx, signal, operator);
+
+        } catch (err) {
+          app.error(`OpenWrt poll error (modem ${idx}): ${err.message}`);
+        }
+      }));
+    } finally {
+      pollInProgress = false;
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -263,7 +295,7 @@ module.exports = function (app) {
 
     values.push({
       path: `${base}.connected`,
-      value: signal.rssi !== null || signal.rsrp !== null
+      value: signal.rssi !== null || signal.rsrp !== null || signal.rsrq !== null || signal.snr !== null
     });
 
     if (values.length === 0) {
